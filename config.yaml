@@ -1,0 +1,32 @@
+telegram:
+  folder_name: "тай"  # Название папки в Telegram Desktop
+
+filter:
+  exclude_words:
+    - "реклама"
+    - "спам"
+    - "casino"
+    - "казино"
+    - "ставки"
+    - "криптовалюта"
+    - "инвестиции"
+    - "пассивный доход"
+    - "куплю usdt"
+    - "продам usdt"
+    - "Binance"
+    - "продам"
+    - "сдам"
+    - "доход"
+    - "заработать"
+    - "заработок"
+
+gemini:
+  model: "gemini-3-flash-preview"
+
+facebook:
+  enabled: true
+  posts_per_group: 20       # Posts to fetch per group
+  scan_interval_minutes: 15 # Auto-scan interval
+
+scheduler:
+  interval_minutes: 10

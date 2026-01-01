@@ -1,0 +1,21 @@
+# Environment
+.env
+
+# Telethon session
+session/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docker
+postgres_data/
