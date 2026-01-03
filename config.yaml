@@ -1,5 +1,5 @@
 telegram:
-  folder_name: "тай"  # Название папки в Telegram Desktop
+  folder_name: "*"  # Название папки в Telegram Desktop
 
 filter:
   exclude_words:

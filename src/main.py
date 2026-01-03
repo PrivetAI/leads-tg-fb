@@ -395,6 +395,18 @@ async def main():
 
     bot.set_facebook_callback(run_facebook_cycle)
 
+    # Reset callback
+    async def reset_chat_states():
+        repo = Repository()
+        try:
+            count = repo.reset_telegram_chat_states()
+            logger.info(f"Reset {count} chat states via /reset command")
+            return count
+        finally:
+            repo.close()
+
+    bot.set_reset_callback(reset_chat_states)
+
     # Setup scheduler
     scheduler = AsyncIOScheduler()
     

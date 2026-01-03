@@ -4,6 +4,7 @@ from typing import Callable
 
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler
+from telegram.error import BadRequest
 
 from src.config import config
 from src.utils.logger import logger
@@ -27,6 +28,7 @@ class NotificationBot:
         self.chat_id = config.admin_chat_id
         self._process_callback: Callable | None = None
         self._facebook_callback: Callable | None = None
+        self._reset_callback: Callable | None = None
         self.is_paused = False
         self.is_facebook_paused = False
         self.last_scan_time: datetime | None = None
@@ -40,6 +42,10 @@ class NotificationBot:
         """Set callback for manual Facebook processing trigger"""
         self._facebook_callback = callback
 
+    def set_reset_callback(self, callback: Callable):
+        """Set callback for resetting chat states"""
+        self._reset_callback = callback
+
     async def start(self):
         """Start bot with command handlers"""
         self.app.add_handler(CommandHandler("start", self._handle_start))
@@ -50,6 +56,8 @@ class NotificationBot:
         self.app.add_handler(CommandHandler("resume", self._handle_resume))
         self.app.add_handler(CommandHandler("resumefb", self._handle_resumefb))
         self.app.add_handler(CommandHandler("status", self._handle_status))
+        self.app.add_handler(CommandHandler("reset", self._handle_reset))
+        self.app.add_handler(CommandHandler("help", self._handle_help))
         self.app.add_handler(CallbackQueryHandler(self._handle_callback))
 
         await self.app.initialize()
@@ -144,6 +152,37 @@ class NotificationBot:
             parse_mode="Markdown"
         )
 
+    async def _handle_reset(self, update: Update, context):
+        """Handle /reset command - clear chat states for re-processing"""
+        if self._reset_callback:
+            count = await self._reset_callback()
+            await update.message.reply_text(
+                f"🔄 Сброшено {count} чатов.\n"
+                f"Следующий /scan загрузит сообщения за 24ч из всех чатов."
+            )
+        else:
+            await update.message.reply_text("❌ Обработчик сброса не настроен")
+
+    async def _handle_help(self, update: Update, context):
+        """Handle /help command - show all available commands"""
+        help_text = (
+            "📚 *Доступные команды:*\n\n"
+            "*Сканирование:*\n"
+            "/scan — Запустить сканирование Telegram\n"
+            "/scanfb — Запустить сканирование Facebook\n\n"
+            "*Управление:*\n"
+            "/pause — Приостановить авто-сканирование Telegram\n"
+            "/pausefb — Приостановить авто-сканирование Facebook\n"
+            "/resume — Возобновить Telegram\n"
+            "/resumefb — Возобновить Facebook\n\n"
+            "*Сброс:*\n"
+            "/reset — Сбросить состояние чатов Telegram (для переобработки сообщений за 24ч)\n\n"
+            "*Инфо:*\n"
+            "/status — Статус бота\n"
+            "/help — Эта справка"
+        )
+        await update.message.reply_text(help_text, parse_mode="Markdown")
+
     async def send_lead(
         self,
         username: str | None,
@@ -199,12 +238,34 @@ class NotificationBot:
         )
 
         try:
+            logger.debug(f"Sending lead (len={len(message)}): {message[:300]}...")
             await self.bot.send_message(
                 chat_id=self.chat_id,
                 text=message,
                 parse_mode="Markdown",
             )
             logger.info(f"Lead sent: user_id={user_id}")
+        except BadRequest as e:
+            # Fallback to plain text if Markdown parsing fails
+            logger.warning(f"Markdown error for user_id={user_id}: {e}. Retrying plain text...")
+            try:
+                plain_contact = f"@{username}" if username else f"{first_name or 'Пользователь'} (ID: {user_id})"
+                plain_message = (
+                    f"{type_emoji} Новый лид! ({confidence_pct}%)\n"
+                    f"📋 Тип: {type_label}\n\n"
+                    f"👤 Контакт: {plain_contact}\n"
+                    f"💬 Чат: {chat_title or 'Неизвестный'}\n"
+                    f"🔗 Ссылка: {msg_link}\n"
+                    f"📝 Сообщение:\n{text[:400]}\n\n"
+                    f"💡 {reason}"
+                )
+                await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=plain_message,
+                )
+                logger.info(f"Lead sent (plain fallback): user_id={user_id}")
+            except Exception as e2:
+                logger.error(f"Failed to send lead (plain): {e2}")
         except Exception as e:
             logger.error(f"Failed to send lead: {e}")
 

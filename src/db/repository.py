@@ -116,4 +116,10 @@ class Repository:
                 self.session.add(post)
         self.session.commit()
 
+    def reset_telegram_chat_states(self) -> int:
+        """Reset all Telegram chat states to re-process messages from last 24h"""
+        count = self.session.query(ChatState).delete()
+        self.session.commit()
+        return count
+
 
