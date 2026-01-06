@@ -330,6 +330,8 @@ class FacebookScraper:
         Returns:
             List of all NEW posts from all groups
         """
+        import time
+        
         if not self.context:
             logger.error("No browser context available")
             return []
@@ -353,22 +355,28 @@ class FacebookScraper:
             # Process groups in batches
             async def scrape_group(page: Page, group: dict) -> list[ParsedPost]:
                 """Scrape a single group, stop when hitting processed post"""
+                group_start = time.time()
+                group_name = group["name"]
+                
                 try:
                     group_url = group["url"]
                     group_id = group["id"]
-                    group_name = group["name"]
                     
                     # Navigate to group - chronological order (newest first)
+                    nav_start = time.time()
                     url_with_sort = f"{group_url}?sorting_setting=CHRONOLOGICAL"
-                    await page.goto(url_with_sort, wait_until="domcontentloaded", timeout=30000)
+                    await page.goto(url_with_sort, wait_until="domcontentloaded", timeout=15000)
+                    logger.debug(f"[{group_name}] Navigation: {time.time() - nav_start:.1f}s")
                     
-                    # Wait for posts to appear (stable wait)
+                    # Wait for posts to appear (reduced timeout)
+                    wait_start = time.time()
                     try:
-                        await page.wait_for_selector('[role="article"]', timeout=10000)
+                        await page.wait_for_selector('[role="article"]', timeout=5000)
                     except:
-                        pass  # Continue even if no articles found initially
+                        pass
+                    logger.debug(f"[{group_name}] Wait for articles: {time.time() - wait_start:.1f}s")
                     
-                    # Get actual group name from page
+                    # Get actual group name from page (quick, no timeout issue)
                     try:
                         h1 = await page.query_selector("h1")
                         if h1:
@@ -382,32 +390,36 @@ class FacebookScraper:
                     seen_texts = set()
                     posts_found = 0
                     scroll_attempts = 0
-                    max_scrolls = 50  # Increased limit for safety
-                    consecutive_empty_scrolls = 0
+                    max_scrolls = 30
+                    consecutive_empty = 0
                     hit_processed = False
+                    parsed_count = 0
+                    
+                    # Initial wait for articles to load
+                    await asyncio.sleep(1)
                     
                     while posts_found < limit_per_group and scroll_attempts < max_scrolls and not hit_processed:
-                        # Find articles
+                        # Get all articles currently on page
                         articles = await page.query_selector_all('[role="article"]')
+                        new_articles = articles[parsed_count:]
                         
-                        # Process articles
-                        new_posts_in_batch = 0
-                        for article in articles:
+                        # Parse only NEW articles
+                        for article in new_articles:
                             if posts_found >= limit_per_group or hit_processed:
                                 break
                             
                             try:
-                                post = await self._parse_article_on_page(page, article, group_id, group_name)
+                                post = await self._parse_article_fast(page, article, group_id, group_name)
                                 if not post:
                                     continue
                                 
-                                # Check if this post was already processed - early stop
+                                # Check if already processed - early stop
                                 if post.post_id in processed_ids:
-                                    logger.info(f"[{group_name}] Hit already-processed post {post.post_id}, stopping")
+                                    logger.info(f"[{group_name}] Hit processed post, stopping")
                                     hit_processed = True
                                     break
                                 
-                                # Dedupe by text hash within this session
+                                # Dedupe by text hash
                                 text_hash = hash(post.text[:100])
                                 if text_hash in seen_texts:
                                     continue
@@ -415,53 +427,62 @@ class FacebookScraper:
                                 
                                 posts.append(post)
                                 posts_found += 1
-                                new_posts_in_batch += 1
                             except:
                                 continue
                         
-                        if not hit_processed:
-                            # Scroll logic
-                            prev_article_count = len(articles)
-                            
-                            # Scroll for more posts
-                            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            
-                            # Wait for new content (stable wait)
-                            try:
-                                await page.wait_for_function(
-                                    f"document.querySelectorAll('[role=\"article\"]').length > {prev_article_count}",
-                                    timeout=4000
-                                )
-                                # If we got here, new content loaded!
-                                consecutive_empty_scrolls = 0
-                            except:
-                                # Timeout means no new articles appeared immediately
-                                consecutive_empty_scrolls += 1
-                            
-                            if consecutive_empty_scrolls >= 5:
-                                logger.info(f"[{group_name}] Stopped scrolling: no new content after 5 attempts")
+                        parsed_count = len(articles)
+                        
+                        # Stop conditions
+                        if hit_processed or posts_found >= limit_per_group:
+                            break
+                        
+                        # Scroll to load more
+                        prev_count = len(articles)
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        
+                        # Wait for new articles to appear (up to 10s)
+                        try:
+                            await page.wait_for_function(
+                                f"document.querySelectorAll('[role=\"article\"]').length > {prev_count}",
+                                timeout=10000
+                            )
+                            consecutive_empty = 0  # Reset on success
+                        except:
+                            # No new articles loaded
+                            consecutive_empty += 1
+                            if consecutive_empty >= 5:  # 5 attempts = 50s of waiting
+                                logger.debug(f"[{group_name}] No more content after {scroll_attempts} scrolls")
                                 break
-                                
-                            scroll_attempts += 1
+                        
+                        scroll_attempts += 1
                     
-                    reason = "hit processed" if hit_processed else f"limit/scrolls"
-                    logger.info(f"[Parallel] {group_name}: {len(posts)} posts ({reason})")
+                    total_time = time.time() - group_start
+                    if hit_processed:
+                        reason = "hit processed"
+                    elif posts_found >= limit_per_group:
+                        reason = "limit reached"
+                    else:
+                        reason = "no more content"
+                    logger.info(f"[{group_name}] {len(posts)} posts in {total_time:.1f}s ({reason})")
                     return posts
                     
                 except Exception as e:
-                    logger.error(f"Error in parallel scrape of {group.get('name', 'unknown')}: {e}")
+                    total_time = time.time() - group_start
+                    logger.error(f"[{group_name}] Error after {total_time:.1f}s: {e}")
                     return []
             
             # Process in batches using workers
             for batch_start in range(0, len(groups), len(pages)):
                 batch = groups[batch_start:batch_start + len(pages)]
+                batch_names = [g["name"][:20] for g in batch]
+                logger.info(f"Batch {batch_start//len(pages)+1}: {batch_names}")
                 
                 # Assign each group to a page with timeout
                 tasks = []
                 for i, group in enumerate(batch):
                     page = pages[i % len(pages)]
-                    # Wrap each group scrape with 60s timeout
-                    task = asyncio.wait_for(scrape_group(page, group), timeout=60.0)
+                    # Wrap each group scrape with 45s timeout (reduced from 60)
+                    task = asyncio.wait_for(scrape_group(page, group), timeout=45.0)
                     tasks.append(task)
                 
                 # Run batch in parallel
@@ -472,7 +493,7 @@ class FacebookScraper:
                         all_posts.extend(result)
                     elif isinstance(result, asyncio.TimeoutError):
                         group_name = batch[idx].get('name', 'unknown') if idx < len(batch) else 'unknown'
-                        logger.warning(f"Timeout scraping group: {group_name}")
+                        logger.warning(f"TIMEOUT: {group_name} (45s)")
                     elif isinstance(result, Exception):
                         logger.error(f"Parallel scrape error: {result}")
             
@@ -486,6 +507,84 @@ class FacebookScraper:
         
         logger.info(f"Parallel scraping complete: {len(all_posts)} total posts from {len(groups)} groups")
         return all_posts
+    
+    async def _parse_article_fast(self, page: Page, article, group_id: str, group_name: str) -> Optional[ParsedPost]:
+        """Article parsing with 'See more' click but strict timeout to prevent hangs"""
+        # Check if this is a valid post (has post link)
+        post_url = ""
+        post_id = ""
+        try:
+            post_link = await article.query_selector('a[href*="/posts/"], a[href*="/permalink/"]')
+            if post_link:
+                href = await post_link.get_attribute("href")
+                if href:
+                    if "comment_id=" in href or "reply_comment_id=" in href:
+                        return None
+                    post_url = href if href.startswith("http") else f"https://www.facebook.com{href}"
+                    match = re.search(r'/posts/(\d+)', href) or re.search(r'/permalink/(\d+)', href)
+                    if match:
+                        post_id = match.group(1)
+        except:
+            pass
+        
+        if not post_url:
+            return None
+        
+        # Get author (quick)
+        author_name = "Unknown"
+        author_id = None
+        try:
+            for selector in ['h2 a[role="link"]', 'h3 a[role="link"]']:
+                author_link = await article.query_selector(selector)
+                if author_link:
+                    name = await author_link.inner_text()
+                    if name and len(name.strip()) > 1:
+                        author_name = name.strip()
+                        break
+        except:
+            pass
+        
+        # Click "See more" with STRICT timeout to get full text
+        try:
+            see_more = await article.query_selector('div[role="button"]:has-text("See more"), div[role="button"]:has-text("Ещё")')
+            if see_more:
+                # Use strict 1s timeout - if it hangs, skip this click
+                try:
+                    await asyncio.wait_for(see_more.click(), timeout=3.0)
+                    await asyncio.sleep(0.3)  # Wait for text to expand
+                except asyncio.TimeoutError:
+                    pass  # Click timed out, continue with truncated text
+        except:
+            pass
+        
+        # Get text (after expanding if successful)
+        text = ""
+        try:
+            text_divs = await article.query_selector_all('div[dir="auto"]')
+            for div in text_divs:
+                t = await div.inner_text()
+                if t and len(t) > 30 and t.strip() != author_name:
+                    text = t.strip()
+                    break
+        except:
+            pass
+        
+        if not text or len(text) < 10:
+            return None
+        
+        if not post_id:
+            post_id = str(abs(hash(text[:100])))
+        
+        return ParsedPost(
+            post_id=post_id,
+            group_id=group_id,
+            group_name=group_name,
+            author_name=author_name[:100],
+            author_id=author_id,
+            text=text[:2000],
+            timestamp=datetime.now(),
+            post_url=post_url
+        )
     
     async def _apply_stealth_to_page(self, page: Page):
         """Apply stealth mode to a specific page"""

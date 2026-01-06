@@ -13,10 +13,10 @@ from src.telegram.userbot import UserBot
 from src.utils.logger import logger
 
 
-async def process_cycle(userbot: UserBot, bot: NotificationBot):
+async def process_cycle(userbot: UserBot, bot: NotificationBot, prompt_type: str = "property"):
     """One processing cycle (runs every N minutes)"""
     logger.info("=" * 50)
-    logger.info("Starting processing cycle")
+    logger.info(f"Starting processing cycle (prompt_type={prompt_type})")
 
     repo = Repository()
     total_messages = 0
@@ -126,14 +126,15 @@ async def process_cycle(userbot: UserBot, bot: NotificationBot):
             (i, msg.user_id, format_text_for_analysis(msg)) 
             for i, (msg, _, _) in enumerate(filtered_messages)
         ]
-        analysis_results, analysis_success = await analyze_messages_batch(texts_to_analyze)
+        analysis_results, analysis_success = await analyze_messages_batch(texts_to_analyze, prompt_type=prompt_type)
 
         if not analysis_success:
             logger.warning("Analysis incomplete due to errors, messages NOT marked as analyzed")
             await bot.send_stats(total_messages, len(filtered_messages), 0, 0)
             return
 
-        # 5. Process results and send leads (only if analysis succeeded)
+        # 5. Process results and collect leads (only if analysis succeeded)
+        leads_list = []
         for i, (msg, db_msg, user) in enumerate(filtered_messages):
             result = analysis_results.get(i)
             if not result:
@@ -144,23 +145,52 @@ async def process_cycle(userbot: UserBot, bot: NotificationBot):
 
             if is_lead:
                 leads_found += 1
-                emoji = "🏠" if lead_type == "property" else "🚗"
+                # Use IT emoji for it_services
+                if lead_type == "it_services":
+                    emoji = "💻"
+                elif lead_type == "vehicle":
+                    emoji = "🚗"
+                else:
+                    emoji = "🏠"
                 logger.info(f"{emoji} Lead found: user={msg.user_id}, type={lead_type}, confidence={confidence:.0%}")
 
-                await bot.send_lead(
-                    username=msg.username,
-                    user_id=msg.user_id,
-                    first_name=msg.first_name,
-                    chat_id=msg.chat_id,
-                    chat_title=msg.chat_title,
-                    chat_username=msg.chat_username,
-                    message_id=msg.message_id,
-                    text=msg.text,
-                    topic_id=msg.topic_id,
-                    confidence=confidence,
-                    reason=reason,
-                    lead_type=lead_type,
-                )
+                # Format contact
+                if msg.username:
+                    contact = f"@{msg.username}"
+                else:
+                    from src.telegram.bot import escape_markdown
+                    name = msg.first_name or "Пользователь"
+                    contact = f"[{escape_markdown(name)}](tg://user?id={msg.user_id})"
+                
+                # Format chat link
+                if msg.chat_username:
+                    if msg.topic_id:
+                        msg_link = f"https://t.me/{msg.chat_username}/{msg.topic_id}/{msg.message_id}"
+                    else:
+                        msg_link = f"https://t.me/{msg.chat_username}/{msg.message_id}"
+                else:
+                    chat_id_positive = abs(msg.chat_id) % (10**10)
+                    if msg.topic_id:
+                        msg_link = f"https://t.me/c/{chat_id_positive}/{msg.topic_id}/{msg.message_id}"
+                    else:
+                        msg_link = f"https://t.me/c/{chat_id_positive}/{msg.message_id}"
+                
+                from src.telegram.bot import escape_markdown
+                chat_title_safe = escape_markdown(msg.chat_title or 'Чат')
+                chat_link = f"[{chat_title_safe}]({msg_link})"
+                
+                leads_list.append({
+                    "contact": contact,
+                    "chat_link": chat_link,
+                    "text": msg.text,
+                    "confidence": confidence,
+                    "reason": reason,
+                    "lead_type": lead_type,
+                })
+        
+        # Send all leads in one message
+        if leads_list:
+            await bot.send_leads_batch(leads_list, source="telegram")
 
         # 6. Update chat states (only after successful analysis)
         for chat_id, max_msg_id in chats_to_update:
@@ -182,12 +212,12 @@ async def process_cycle(userbot: UserBot, bot: NotificationBot):
         repo.close()
 
 
-async def process_facebook_cycle(fb_scraper, bot: NotificationBot):
+async def process_facebook_cycle(fb_scraper, bot: NotificationBot, prompt_type: str = "property"):
     """Facebook processing cycle"""
     from src.facebook.scraper import FacebookScraper
     
     logger.info("=" * 50)
-    logger.info("Starting Facebook processing cycle")
+    logger.info(f"Starting Facebook processing cycle (prompt_type={prompt_type})")
 
     repo = Repository()
     total_posts = 0
@@ -258,13 +288,15 @@ async def process_facebook_cycle(fb_scraper, bot: NotificationBot):
             await bot.send_stats(total_posts, 0, 0, 0, source="facebook")
             return
 
-        # 4. Filter posts (exclude words)
+        # 4. Filter posts (exclude words) and track per-group counts
         filtered_posts = []
+        posts_per_group = {}  # group_name -> count
         for post in new_posts:
             text_lower = post.text.lower()
             excluded = any(word in text_lower for word in config.exclude_words)
             if not excluded:
                 filtered_posts.append(post)
+                posts_per_group[post.group_name] = posts_per_group.get(post.group_name, 0) + 1
 
         logger.info(f"After exclude words filter: {len(filtered_posts)} posts")
 
@@ -276,7 +308,7 @@ async def process_facebook_cycle(fb_scraper, bot: NotificationBot):
 
         # 5. Analyze with Gemini (batch)
         texts_to_analyze = [(i, post.text) for i, post in enumerate(filtered_posts)]
-        analysis_results, analysis_success = await analyze_messages_batch(texts_to_analyze)
+        analysis_results, analysis_success = await analyze_messages_batch(texts_to_analyze, prompt_type=prompt_type)
 
         if not analysis_success:
             logger.warning("Facebook analysis incomplete due to errors")
@@ -285,6 +317,7 @@ async def process_facebook_cycle(fb_scraper, bot: NotificationBot):
 
         # 6. Process results and collect leads
         leads_list = []
+        leads_per_group = {}  # group_name -> count
         for i, post in enumerate(filtered_posts):
             result = analysis_results.get(i)
             if not result:
@@ -294,14 +327,29 @@ async def process_facebook_cycle(fb_scraper, bot: NotificationBot):
 
             if is_lead:
                 leads_found += 1
-                emoji = "🏠" if lead_type == "property" else "🚗"
+                leads_per_group[post.group_name] = leads_per_group.get(post.group_name, 0) + 1
+                # Use IT emoji for it_services
+                if lead_type == "it_services":
+                    emoji = "💻"
+                elif lead_type == "vehicle":
+                    emoji = "🚗"
+                else:
+                    emoji = "🏠"
                 logger.info(f"{emoji} FB Lead: author={post.author_name}, type={lead_type}, confidence={confidence:.0%}")
 
+                # Format contact
+                if post.author_id:
+                    contact = f"[{post.author_name}](https://facebook.com/profile.php?id={post.author_id})"
+                else:
+                    contact = post.author_name
+                
+                # Format chat link
+                from src.telegram.bot import escape_markdown
+                chat_link = f"[{escape_markdown(post.group_name[:40])}]({post.post_url})"
+                
                 leads_list.append({
-                    "author_name": post.author_name,
-                    "author_id": post.author_id,
-                    "group_name": post.group_name,
-                    "post_url": post.post_url,
+                    "contact": contact,
+                    "chat_link": chat_link,
                     "text": post.text,
                     "confidence": confidence,
                     "reason": reason,
@@ -310,7 +358,7 @@ async def process_facebook_cycle(fb_scraper, bot: NotificationBot):
 
         # 7. Send leads in one batch message
         if leads_list:
-            await bot.send_facebook_leads_batch(leads_list)
+            await bot.send_leads_batch(leads_list, source="facebook")
 
         # 8. Mark all new posts as processed (after successful analysis)
         repo.mark_facebook_posts_batch([(p.post_id, p.group_id) for p in new_posts])
@@ -328,6 +376,9 @@ async def process_facebook_cycle(fb_scraper, bot: NotificationBot):
             source="facebook",
             groups_count=len(groups_scanned),
         )
+        
+        # 11. Send per-group breakdown
+        await bot.send_group_breakdown(posts_per_group, leads_per_group)
 
         logger.info(f"Facebook cycle complete: total={total_posts}, new={len(new_posts)}, filtered={len(filtered_posts)}, leads={leads_found}")
 
@@ -363,20 +414,20 @@ async def main():
             fb_scraper = None
 
     # Telegram callbacks
-    async def run_telegram_cycle():
-        await process_cycle(userbot, bot)
+    async def run_telegram_cycle(prompt_type: str = "property"):
+        await process_cycle(userbot, bot, prompt_type)
         bot.last_scan_time = datetime.now()
     
     async def scheduled_telegram():
         if not bot.is_paused:
-            await run_telegram_cycle()
+            await run_telegram_cycle("property")
         else:
             logger.info("Scheduled Telegram scan skipped (paused)")
 
     bot.set_process_callback(run_telegram_cycle)
 
     # Facebook callbacks
-    async def run_facebook_cycle():
+    async def run_facebook_cycle(prompt_type: str = "property"):
         nonlocal fb_scraper
         if fb_scraper is None:
             from src.facebook.scraper import FacebookScraper
@@ -384,12 +435,12 @@ async def main():
             if not await fb_scraper.start():
                 logger.error("Facebook scraper not connected")
                 return
-        await process_facebook_cycle(fb_scraper, bot)
+        await process_facebook_cycle(fb_scraper, bot, prompt_type)
         bot.last_facebook_scan_time = datetime.now()
     
     async def scheduled_facebook():
         if not bot.is_facebook_paused and config.facebook_enabled:
-            await run_facebook_cycle()
+            await run_facebook_cycle("property")
         else:
             logger.info("Scheduled Facebook scan skipped (paused or disabled)")
 
@@ -432,8 +483,8 @@ async def main():
     # Run first cycles immediately
     if config.scan_mode == "timer":
         # Launch both in parallel or sequence
-        asyncio.create_task(run_facebook_cycle())
-        await run_telegram_cycle()
+        asyncio.create_task(run_facebook_cycle("property"))
+        await run_telegram_cycle("property")
 
     # Keep running
     try:

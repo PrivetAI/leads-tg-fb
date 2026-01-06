@@ -4,7 +4,7 @@ services:
     env_file: .env
     environment:
       - CHROME_CDP_URL=http://172.17.0.1:9223
-      - TEST_MODE=1
+      # - TEST_MODE=1
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

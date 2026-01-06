@@ -4,7 +4,7 @@ import json
 import httpx
 
 from src.config import config
-from src.processing.prompts import BATCH_PROMPT
+from src.processing.prompts import BATCH_PROMPT, IT_SERVICES_PROMPT
 from src.utils.logger import logger, log_prompt, log_text_preview, log_lead_found, log_analysis_result
 
 # Initialize Gemini if needed
@@ -90,7 +90,7 @@ def parse_response(result_text: str) -> list[dict]:
         return []
 
 
-async def analyze_batch(messages: list[tuple[int, str]], max_retries: int = 3) -> dict[int, tuple[bool, str, float, str]]:
+async def analyze_batch(messages: list[tuple[int, str]], max_retries: int = 3, prompt_type: str = "property") -> dict[int, tuple[bool, str, float, str]]:
     """
     Analyze batch of messages with LLM API call.
     Returns only leads with (is_lead, reason, confidence, lead_type).
@@ -110,7 +110,12 @@ async def analyze_batch(messages: list[tuple[int, str]], max_retries: int = 3) -
             formatted_lines.append(f"[{idx}] {text}")
     
     formatted = "\n\n".join(formatted_lines)
-    prompt = BATCH_PROMPT.format(messages=formatted)
+    
+    # Select prompt based on type
+    if prompt_type == "it_services":
+        prompt = IT_SERVICES_PROMPT.format(messages=formatted)
+    else:
+        prompt = BATCH_PROMPT.format(messages=formatted)
     
     # Log texts being analyzed
     for item in messages:
@@ -167,7 +172,8 @@ async def analyze_batch(messages: list[tuple[int, str]], max_retries: int = 3) -
 async def analyze_messages_batch(
     texts: list[tuple[int, str]], 
     batch_size: int = 100,
-    max_parallel: int = 3
+    max_parallel: int = 3,
+    prompt_type: str = "property"
 ) -> tuple[dict[int, tuple[bool, str, float]], bool]:
     """
     Analyze messages in batches (parallel processing).
@@ -198,7 +204,7 @@ async def analyze_messages_batch(
         logger.info(f"Analyzing batches {batch_nums[0]}-{batch_nums[-1]}/{total_batches} in parallel")
         
         # Run this group in parallel
-        tasks = [analyze_batch(batch) for batch in group]
+        tasks = [analyze_batch(batch, prompt_type=prompt_type) for batch in group]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Process results

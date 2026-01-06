@@ -11,13 +11,17 @@ from src.utils.logger import logger
 
 
 def escape_markdown(text: str) -> str:
-    """Escape Markdown special characters in text"""
+    """Escape Markdown special characters in text (for legacy Markdown mode)"""
     if not text:
         return ""
-    # Escape backslash first, then other special chars
-    text = text.replace('\\', '\\\\')
-    for char in ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']:
-        text = text.replace(char, '\\' + char)
+    # For legacy Markdown: escape *, `, [, ]
+    # For underscores: escape them to prevent italic parsing
+    text = text.replace('\\', '\\\\')  # Escape backslashes first
+    text = text.replace('*', '\\*')
+    text = text.replace('`', '\\`')
+    text = text.replace('[', '\\[')
+    text = text.replace(']', '\\]')
+    text = text.replace('_', '\\_')  # Escape underscores to prevent _italic_
     return text
 
 
@@ -26,8 +30,8 @@ class NotificationBot:
         self.app = Application.builder().token(config.bot_token).build()
         self.bot = self.app.bot
         self.chat_id = config.admin_chat_id
-        self._process_callback: Callable | None = None
-        self._facebook_callback: Callable | None = None
+        self._process_callback: Callable | None = None  # callback(prompt_type) -> None
+        self._facebook_callback: Callable | None = None  # callback(prompt_type) -> None
         self._reset_callback: Callable | None = None
         self.is_paused = False
         self.is_facebook_paused = False
@@ -72,47 +76,92 @@ class NotificationBot:
         await self.app.shutdown()
 
     async def _handle_start(self, update: Update, context):
-        """Handle /start command"""
+        """Handle /start command - show source selection"""
+        await self._show_source_selection(update.message)
+
+    async def _handle_scan(self, update: Update, context):
+        """Handle /scan command - show source selection menu"""
+        await self._show_source_selection(update.message)
+
+    async def _handle_scanfb(self, update: Update, context):
+        """Deprecated - redirect to /scan"""
+        await self._show_source_selection(update.message)
+
+    async def _show_source_selection(self, message):
+        """Show source selection buttons (Telegram/Facebook)"""
         keyboard = [
-            [InlineKeyboardButton("📱 Telegram", callback_data="scan")],
-            [InlineKeyboardButton("📘 Facebook", callback_data="scanfb")],
+            [InlineKeyboardButton("📱 Telegram", callback_data="source:tg")],
+            [InlineKeyboardButton("📘 Facebook", callback_data="source:fb")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(
-            "🤖 *Lead Parser Bot*\n\n"
-            "Выберите источник для сканирования:",
+        await message.reply_text(
+            "🔍 *Выберите источник:*",
             parse_mode="Markdown",
             reply_markup=reply_markup,
         )
 
-    async def _handle_scan(self, update: Update, context):
-        """Handle /scan command (Telegram)"""
-        if self._process_callback:
-            await update.message.reply_text("🔄 Запускаю сканирование Telegram...")
-            asyncio.create_task(self._process_callback())
-        else:
-            await update.message.reply_text("❌ Обработчик Telegram не настроен")
-
-    async def _handle_scanfb(self, update: Update, context):
-        """Handle /scanfb command (Facebook)"""
-        if self._facebook_callback:
-            await update.message.reply_text("🔄 Запускаю сканирование Facebook...")
-            asyncio.create_task(self._facebook_callback())
-        else:
-            await update.message.reply_text("❌ Обработчик Facebook не настроен")
+    async def _show_type_selection(self, query, source: str):
+        """Show lead type selection buttons (Property/IT)"""
+        keyboard = [
+            [InlineKeyboardButton("🏠 Недвижимость / 🚗 Транспорт", callback_data=f"run:{source}:property")],
+            [InlineKeyboardButton("💻 IT-услуги / AI / Боты", callback_data=f"run:{source}:it_services")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back:source")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        source_name = "Telegram" if source == "tg" else "Facebook"
+        await query.edit_message_text(
+            f"📌 *{source_name}* — выберите тип лидов:",
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
 
     async def _handle_callback(self, update: Update, context):
         """Handle button callbacks"""
         query = update.callback_query
         await query.answer()
+        data = query.data
 
-        if query.data == "scan" and self._process_callback:
-            await query.edit_message_text("🔄 Запускаю сканирование Telegram...")
-            asyncio.create_task(self._process_callback())
-        elif query.data == "scanfb" and self._facebook_callback:
-            await query.edit_message_text("🔄 Запускаю сканирование Facebook...")
-            asyncio.create_task(self._facebook_callback())
+        # Source selection: source:tg or source:fb
+        if data.startswith("source:"):
+            source = data.split(":")[1]
+            await self._show_type_selection(query, source)
+        
+        # Back to source selection
+        elif data == "back:source":
+            keyboard = [
+                [InlineKeyboardButton("📱 Telegram", callback_data="source:tg")],
+                [InlineKeyboardButton("📘 Facebook", callback_data="source:fb")],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "🔍 *Выберите источник:*",
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+            )
+        
+        # Run scan: run:tg:property or run:fb:it_services
+        elif data.startswith("run:"):
+            parts = data.split(":")
+            source = parts[1]
+            prompt_type = parts[2]
+            
+            source_name = "Telegram" if source == "tg" else "Facebook"
+            type_label = "IT-услуги" if prompt_type == "it_services" else "Недвижимость/Транспорт"
+            
+            await query.edit_message_text(f"🔄 Запускаю {source_name} ({type_label})...")
+            
+            if source == "tg" and self._process_callback:
+                asyncio.create_task(self._process_callback(prompt_type))
+            elif source == "fb" and self._facebook_callback:
+                asyncio.create_task(self._facebook_callback(prompt_type))
+            else:
+                await query.edit_message_text(f"❌ Обработчик {source_name} не настроен")
+        
+        # Legacy callbacks for stats buttons
+        elif data == "scan" and self._process_callback:
+            await self._show_type_selection(query, "tg")
+        elif data == "scanfb" and self._facebook_callback:
+            await self._show_type_selection(query, "fb")
 
     async def _handle_pause(self, update: Update, context):
         """Handle /pause command (Telegram)"""
@@ -168,15 +217,14 @@ class NotificationBot:
         help_text = (
             "📚 *Доступные команды:*\n\n"
             "*Сканирование:*\n"
-            "/scan — Запустить сканирование Telegram\n"
-            "/scanfb — Запустить сканирование Facebook\n\n"
+            "/scan — Меню выбора источника и типа лидов\n\n"
             "*Управление:*\n"
-            "/pause — Приостановить авто-сканирование Telegram\n"
-            "/pausefb — Приостановить авто-сканирование Facebook\n"
+            "/pause — Приостановить авто\\-сканирование Telegram\n"
+            "/pausefb — Приостановить авто\\-сканирование Facebook\n"
             "/resume — Возобновить Telegram\n"
             "/resumefb — Возобновить Facebook\n\n"
             "*Сброс:*\n"
-            "/reset — Сбросить состояние чатов Telegram (для переобработки сообщений за 24ч)\n\n"
+            "/reset — Сбросить состояние чатов Telegram\n\n"
             "*Инфо:*\n"
             "/status — Статус бота\n"
             "/help — Эта справка"
@@ -234,7 +282,7 @@ class NotificationBot:
             f"👤 Контакт: {contact}\n"
             f"💬 Чат: {chat_link}\n"
             f"📝 Сообщение:\n{escape_markdown(text[:400])}\n\n"
-            f"💡 _{escape_markdown(reason)}_"
+            f"💡 {escape_markdown(reason)}"
         )
 
         try:
@@ -338,7 +386,7 @@ class NotificationBot:
             f"👤 Автор: {contact}\n"
             f"💬 Группа: [{escape_markdown(group_name)}]({post_url})\n"
             f"📝 Пост:\n{escape_markdown(text[:400])}\n\n"
-            f"💡 _{escape_markdown(reason)}_"
+            f"💡 {escape_markdown(reason)}"
         )
 
         try:
@@ -351,18 +399,17 @@ class NotificationBot:
         except Exception as e:
             logger.error(f"Failed to send Facebook lead: {e}")
 
-    async def send_facebook_leads_batch(
+    async def send_leads_batch(
         self,
         leads: list[dict],
+        source: str = "telegram",
     ):
         """
-        Send all Facebook leads in ONE combined message.
+        Send all leads in messages (split if needed to avoid 4096 char limit).
         
         Each lead dict should have:
-        - author_name: str
-        - author_id: str | None
-        - group_name: str
-        - post_url: str
+        - contact: str (formatted contact link)
+        - chat_link: str (formatted chat/group link with message link)
         - text: str
         - confidence: float
         - reason: str
@@ -371,38 +418,94 @@ class NotificationBot:
         if not leads:
             return
         
-        lines = [f"📘 *Facebook: {len(leads)} лидов найдено!*\n"]
+        source_emoji = "📱" if source == "telegram" else "📘"
+        source_name = "Telegram" if source == "telegram" else "Facebook"
         
+        # Format all lead blocks
+        lead_blocks = []
         for i, lead in enumerate(leads, 1):
-            author_name = lead.get("author_name", "Unknown")
-            author_id = lead.get("author_id")
-            group_name = lead.get("group_name", "")
-            post_url = lead.get("post_url", "")
-            text = lead.get("text", "")[:150]
+            contact = lead.get("contact", "Unknown")
+            chat_link = lead.get("chat_link", "")
+            text = lead.get("text", "")[:400]
             confidence = lead.get("confidence", 0)
+            reason = lead.get("reason", "")
             lead_type = lead.get("lead_type", "property")
             
-            # Contact link
-            if author_id:
-                contact = f"[{author_name}](https://facebook.com/profile.php?id={author_id})"
-            else:
-                contact = author_name
-            
-            # Type emoji
-            type_emoji = "🏠" if lead_type == "property" else "🚗"
+            type_emoji = "🏠" if lead_type == "property" else ("💻" if lead_type == "it_services" else "🚗")
             confidence_pct = int(confidence * 100)
             
-            lines.append(
-                f"{i}. {type_emoji} ({confidence_pct}%) {contact}\n"
-                f"   📍 [{escape_markdown(group_name[:30])}]({post_url})\n"
-                f"   _{escape_markdown(text[:100])}..._\n"
+            block = (
+                f"{'─' * 20}\n"
+                f"{i}. {type_emoji} *({confidence_pct}%)* {contact}\n"
+                f"📍 {chat_link}\n"
+                f"📝 {escape_markdown(text)}\n"
+                f"💡 {escape_markdown(reason)}"
             )
+            lead_blocks.append(block)
+        
+        # Split into messages that fit 4096 limit
+        messages = []
+        header = f"{source_emoji} *{source_name}: {len(leads)} лидов найдено!*\n\n"
+        current_msg = header
+        
+        for block in lead_blocks:
+            if len(current_msg) + len(block) + 2 > 3900:  # Leave margin
+                messages.append(current_msg)
+                current_msg = f"{source_emoji} *{source_name} (продолжение):*\n\n"
+            current_msg += block + "\n\n"
+        
+        if current_msg.strip():
+            messages.append(current_msg)
+        
+        # Send all messages
+        for msg in messages:
+            try:
+                await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=msg,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            except BadRequest as e:
+                # Fallback to plain text if Markdown fails
+                logger.warning(f"Markdown error, falling back to plain text: {e}")
+                # Strip markdown formatting for plain text
+                plain_msg = msg.replace('*', '').replace('_', '').replace('\\', '')
+                try:
+                    await self.bot.send_message(
+                        chat_id=self.chat_id,
+                        text=plain_msg,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e2:
+                    logger.error(f"Failed to send even plain text: {e2}")
+        logger.info(f"{source_name} leads batch sent: {len(leads)} leads in {len(messages)} message(s)")
+
+    async def send_group_breakdown(
+        self,
+        posts_per_group: dict[str, int],
+        leads_per_group: dict[str, int],
+    ):
+        """Send breakdown of posts and leads per group"""
+        if not posts_per_group:
+            return
+        
+        # Sort by posts count descending
+        sorted_groups = sorted(posts_per_group.items(), key=lambda x: x[1], reverse=True)
+        
+        lines = ["📊 *Разбивка по группам:*\n"]
+        for group_name, posts in sorted_groups:
+            leads = leads_per_group.get(group_name, 0)
+            leads_str = f"лидов🎯{leads}" if leads > 0 else ""
+            # Truncate long names
+            name = group_name[:35] + "..." if len(group_name) > 35 else group_name
+            lines.append(f"• {escape_markdown(name)}: {posts} пост. {leads_str}")
         
         message = "\n".join(lines)
         
-        # Telegram has 4096 char limit - split if needed
+        # Split if too long
         if len(message) > 4000:
-            message = message[:4000] + "\n\n... (обрезано)"
+            message = message[:4000] + "\n..."
         
         try:
             await self.bot.send_message(
@@ -411,7 +514,5 @@ class NotificationBot:
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
             )
-            logger.info(f"Facebook leads batch sent: {len(leads)} leads")
         except Exception as e:
-            logger.error(f"Failed to send Facebook leads batch: {e}")
-
+            logger.error(f"Failed to send group breakdown: {e}")
